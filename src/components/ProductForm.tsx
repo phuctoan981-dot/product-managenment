@@ -8,7 +8,14 @@ import {
 import { Link } from "react-router-dom";
 
 import { fileToCompressedDataUrl } from "../utils/image";
-import type { Product, ProductColor, ProductInput } from "../types/product";
+import { getYouTubeId } from "../utils/media";
+import { MediaPreview } from "./MediaPreview.tsx";
+import type {
+  Product,
+  ProductColor,
+  ProductInput,
+  ProductMedia,
+} from "../types/product";
 import { formatInputPrice, parsePrice } from "../utils/format.ts";
 import {
   COLOR_PRESETS,
@@ -33,6 +40,9 @@ interface ColorForm {
 }
 
 type FormErrors = Record<string, string>;
+
+// localStorage chỉ ~5MB cho cả cửa hàng, nên giới hạn số ảnh và chỉ nhận video qua link
+const MAX_MEDIA = 8;
 
 /* ------------------------------------------------------------------ */
 /* Component con                                                       */
@@ -186,6 +196,11 @@ export default function ProductForm({
   );
   const [description, setDescription] = useState(initial?.description ?? "");
   const [image, setImage] = useState(initial?.image ?? "");
+  const [media, setMedia] = useState<ProductMedia[]>(initial?.media ?? []);
+  const [videoLink, setVideoLink] = useState("");
+
+  // Sản phẩm cũ chưa có loại thì vẫn cho chọn một lần, tránh bị kẹt khi sửa
+  const typeLocked = Boolean(initial?.productType);
 
   const [specs, setSpecs] = useState<Record<string, SpecValue>>(
     initial?.specs ?? {},
@@ -218,7 +233,7 @@ export default function ProductForm({
   /* ---------- loại sản phẩm & thông số ---------- */
 
   const handleTypeChange = (next: ProductType) => {
-    if (next === productType) return;
+    if (typeLocked || next === productType) return;
 
     setProductType(next);
     setSpecs((current) => pruneSpecs(current, next));
@@ -271,6 +286,100 @@ export default function ProductForm({
         })),
       );
   };
+
+  /* ---------- thư viện ảnh & video ---------- */
+
+  const handleMediaFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = ""; // cho phép chọn lại đúng file vừa chọn
+    if (files.length === 0) return;
+
+    const problems: string[] = [];
+    const slots = Math.max(MAX_MEDIA - media.length, 0);
+    const accepted = files.slice(0, slots);
+
+    if (files.length > accepted.length) {
+      problems.push(`Tối đa ${MAX_MEDIA} ảnh/video cho mỗi sản phẩm.`);
+    }
+
+    const results = await Promise.all(
+      accepted.map(async (file): Promise<ProductMedia | null> => {
+        try {
+          if (file.type.startsWith("image/")) {
+            return {
+              id: crypto.randomUUID(),
+              type: "image",
+              url: await fileToCompressedDataUrl(file),
+            };
+          }
+
+          problems.push(`"${file.name}" không phải file ảnh.`);
+        } catch {
+          problems.push(`Không đọc được "${file.name}".`);
+        }
+
+        return null;
+      }),
+    );
+
+    const added = results.filter((item): item is ProductMedia => item !== null);
+
+    if (added.length > 0) {
+      setMedia((current) => [...current, ...added].slice(0, MAX_MEDIA));
+    }
+
+    if (problems.length > 0) {
+      setErrors((current) => ({ ...current, media: problems.join(" ") }));
+    } else {
+      clearError("media");
+    }
+  };
+
+  const addVideoLink = () => {
+    const url = videoLink.trim();
+    if (!url) return;
+
+    const fail = (message: string) =>
+      setErrors((current) => ({ ...current, media: message }));
+
+    // Chỉ nhận http(s) để tránh link độc hại kiểu javascript:
+    if (!/^https?:\/\//i.test(url)) {
+      return fail("Link video phải bắt đầu bằng http:// hoặc https://");
+    }
+
+    if (!getYouTubeId(url) && !/\.(mp4|webm|ogg)(\?.*)?$/i.test(url)) {
+      return fail("Chỉ hỗ trợ link YouTube hoặc file video .mp4 / .webm / .ogg.");
+    }
+
+    if (media.length >= MAX_MEDIA) {
+      return fail(`Tối đa ${MAX_MEDIA} ảnh/video cho mỗi sản phẩm.`);
+    }
+
+    setMedia((current) => [
+      ...current,
+      { id: crypto.randomUUID(), type: "video", url },
+    ]);
+    setVideoLink("");
+    clearError("media");
+  };
+
+  const handleVideoLinkKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addVideoLink();
+    }
+  };
+
+  const removeMedia = (id: string) =>
+    setMedia((current) => current.filter((item) => item.id !== id));
+
+  const moveMediaToFirst = (id: string) =>
+    setMedia((current) => {
+      const target = current.find((item) => item.id === id);
+      return target
+        ? [target, ...current.filter((item) => item.id !== id)]
+        : current;
+    });
 
   /* ---------- màu sắc ---------- */
 
@@ -447,6 +556,7 @@ export default function ProductForm({
         : Number(quantity),
       description: description.trim(),
       image,
+      media,
       colors: productColors,
       features,
       specs: collectSpecs(productType, specs),
@@ -490,11 +600,17 @@ export default function ProductForm({
         <div className="form-section" data-invalid={errors.type ? "true" : undefined}>
           <div className="form-section-title">
             <h3>Loại sản phẩm *</h3>
-            <p>Mỗi loại có bộ thông số kỹ thuật riêng.</p>
+            <p>
+              {typeLocked
+                ? "Loại sản phẩm đã được khóa, không thể thay đổi sau khi tạo."
+                : "Mỗi loại có bộ thông số kỹ thuật riêng. Chọn cẩn thận vì sẽ không đổi được sau khi thêm sản phẩm."}
+            </p>
           </div>
 
           <div className="type-picker" role="radiogroup" aria-label="Loại sản phẩm">
-            {PRODUCT_TYPE_LIST.map((item) => {
+            {PRODUCT_TYPE_LIST.filter(
+              (item) => !typeLocked || item.key === productType,
+            ).map((item) => {
               const active = item.key === productType;
 
               return (
@@ -503,10 +619,15 @@ export default function ProductForm({
                   type="button"
                   role="radio"
                   aria-checked={active}
+                  aria-disabled={typeLocked}
+                  disabled={typeLocked}
                   className={`type-card ${active ? "type-card-active" : ""}`.trim()}
                   onClick={() => handleTypeChange(item.key)}
                 >
-                  <strong>{item.label}</strong>
+                  <strong>
+                    {item.label}
+                    {typeLocked && " 🔒"}
+                  </strong>
                   <small>{item.hint}</small>
                 </button>
               );
@@ -674,6 +795,90 @@ export default function ProductForm({
                   )}
                 </Field>
               </div>
+            </div>
+
+            {/* ẢNH & VIDEO */}
+
+            <div className="form-section">
+              <div className="form-section-title">
+                <h3>Ảnh & video sản phẩm</h3>
+                <p>
+                  Hiển thị trong trang chi tiết. Tối đa {MAX_MEDIA} mục. Ảnh tải
+                  từ máy; video thêm bằng link YouTube hoặc file .mp4 / .webm.
+                </p>
+              </div>
+
+              <Field
+                label="Tải ảnh"
+                error={errors.media}
+                hint="Chọn được nhiều ảnh cùng lúc, ảnh sẽ được nén tự động."
+                htmlFor="media-files"
+                className="full"
+              >
+                <input
+                  id="media-files"
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  disabled={media.length >= MAX_MEDIA}
+                  onChange={handleMediaFiles}
+                />
+              </Field>
+
+              <div className="feature-input-row">
+                <input
+                  type="url"
+                  value={videoLink}
+                  onChange={(event) => setVideoLink(event.target.value)}
+                  onKeyDown={handleVideoLinkKeyDown}
+                  placeholder="Hoặc dán link video YouTube / .mp4"
+                />
+
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={addVideoLink}
+                >
+                  + Thêm video
+                </button>
+              </div>
+
+              {media.length === 0 ? (
+                <div className="option-empty">Chưa có ảnh hoặc video nào.</div>
+              ) : (
+                <div className="media-grid">
+                  {media.map((item, index) => (
+                    <div className="media-card" key={item.id}>
+                      <div className="media-thumb">
+                        <MediaPreview item={item} />
+                        {index === 0 && (
+                          <span className="media-badge">Hiển thị đầu tiên</span>
+                        )}
+                      </div>
+
+                      <div className="media-actions">
+                        {index > 0 && (
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            onClick={() => moveMediaToFirst(item.id)}
+                          >
+                            Đặt lên đầu
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          className="delete-button"
+                          onClick={() => removeMedia(item.id)}
+                        >
+                          Xóa
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* THÔNG SỐ THEO LOẠI */}
