@@ -1,39 +1,47 @@
+
 import { useState, type FormEvent } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import CancelOrderDialog from "../components/CancelOrderDialog";
+import InstallmentPanel from "../components/InstallmentPanel";
 import ProductThumb from "../components/ProductThumb";
 import StatusBadge from "../components/StatusBadge";
 import { useOrders } from "../context/OrderContext";
 import { useProducts } from "../context/ProductContext";
 import type { OrderInfoInput, PaymentMethod } from "../types/order";
+import { canonicalPhone } from "../utils/customers";
 import { formatPrice } from "../utils/format";
 import {
   formatDateTime,
+  getAllowedTransitions,
+  getNextStatus,
   getOrderHistory,
+  getStatusFlow,
+  installmentPaid,
+  installmentRemaining,
   PAYMENT_LABEL,
   STATUS_ACTION_LABEL,
-  STATUS_FLOW,
   STATUS_LABEL,
-  STATUS_TRANSITIONS,
 } from "../utils/orders";
 
 export default function OrderDetail() {
   const { id } = useParams();
 
-  // key={id}: chuyển sang đơn khác thì reset form và thông báo
   return <OrderDetailView key={id} id={id} />;
 }
 
 function OrderDetailView({ id }: { id?: string }) {
   const { getOrderById, updateOrderStatus, updateOrderInfo } =
     useOrders();
+
   const { getProductById } = useProducts();
 
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [showCancel, setShowCancel] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [isUpdating, setIsUpdating] = useState(false);
+
   const [form, setForm] = useState<OrderInfoInput>({
     customerName: "",
     customerPhone: "",
@@ -64,40 +72,89 @@ function OrderDetailView({ id }: { id?: string }) {
   }
 
   const isCancelled = order.status === "cancelled";
-  const transitions = STATUS_TRANSITIONS[order.status];
+  const transitions = getAllowedTransitions(order);
+
   const forwardSteps = transitions.filter(
     (status) => status !== "cancelled",
   );
+
   const canCancel = transitions.includes("cancelled");
   const history = getOrderHistory(order);
-  const flowIndex = STATUS_FLOW.indexOf(order.status);
+  const flow = getStatusFlow(order);
+  const flowIndex = flow.indexOf(order.status);
+  const nextStatus = getNextStatus(order);
+  const remaining = installmentRemaining(order);
 
-  const handleAdvance = (status: (typeof transitions)[number]) => {
-    const result = updateOrderStatus(order.id, status);
+  const completeBlocked =
+    order.paymentMethod === "installment" &&
+    order.status === "installment" &&
+    remaining > 0;
 
-    if (result.ok) {
-      setError("");
-      setNotice(`Đã chuyển đơn sang "${STATUS_LABEL[status]}".`);
-    } else {
-      setNotice("");
-      setError(result.error);
+  // Cập nhật trạng thái và chờ backend xử lý.
+  const handleAdvance = async (
+    status: (typeof transitions)[number],
+  ) => {
+    if (isUpdating) return;
+
+    setIsUpdating(true);
+    setError("");
+    setNotice("");
+
+    try {
+      const result = await updateOrderStatus(order.id, status);
+
+      if (result.ok) {
+        setNotice(
+          `Đã chuyển đơn sang "${STATUS_LABEL[status]}".`,
+        );
+      } else {
+        setError(result.error);
+      }
+    } catch (error) {
+      console.error("Lỗi cập nhật trạng thái đơn hàng:", error);
+
+      setError(
+        error instanceof Error
+          ? error.message
+          : "Không thể cập nhật trạng thái đơn hàng.",
+      );
+    } finally {
+      setIsUpdating(false);
     }
   };
 
-  const handleCancelConfirm = (reason: string) => {
-    const result = updateOrderStatus(order.id, "cancelled", {
-      reason,
-    });
+  // Hủy đơn và chờ backend hoàn hàng về kho.
+  const handleCancelConfirm = async (reason: string) => {
+    if (isUpdating) return;
 
-    setShowCancel(false);
+    setIsUpdating(true);
+    setError("");
+    setNotice("");
 
-    if (result.ok) {
-      setError("");
-      setEditing(false);
-      setNotice("Đã hủy đơn và hoàn hàng về kho.");
-    } else {
-      setNotice("");
-      setError(result.error);
+    try {
+      const result = await updateOrderStatus(
+        order.id,
+        "cancelled",
+        { reason },
+      );
+
+      if (result.ok) {
+        setShowCancel(false);
+        setEditing(false);
+        setNotice("Đã hủy đơn và hoàn hàng về kho.");
+      } else {
+        setError(result.error);
+      }
+    } catch (error) {
+      console.error("Lỗi hủy đơn hàng:", error);
+
+      setError(
+        error instanceof Error
+          ? error.message
+          : "Không thể hủy đơn hàng. Vui lòng thử lại.",
+      );
+    } finally {
+      setIsUpdating(false);
     }
   };
 
@@ -108,6 +165,7 @@ function OrderDetailView({ id }: { id?: string }) {
       note: order.note,
       paymentMethod: order.paymentMethod,
     });
+
     setError("");
     setNotice("");
     setEditing(true);
@@ -184,7 +242,7 @@ function OrderDetailView({ id }: { id?: string }) {
         ) : (
           <>
             <ol className="order-steps" aria-label="Tiến trình đơn hàng">
-              {STATUS_FLOW.map((status, index) => (
+              {flow.map((status, index) => (
                 <li
                   key={status}
                   className={
@@ -210,16 +268,24 @@ function OrderDetailView({ id }: { id?: string }) {
             </ol>
 
             <div className="order-process-actions">
-              {forwardSteps.map((status, index) => (
+              {forwardSteps.map((status) => (
                 <button
                   key={status}
                   type="button"
                   className={
-                    index === 0 ? "primary-button" : "secondary-button"
+                    status === nextStatus
+                      ? "primary-button"
+                      : "secondary-button"
+                  }
+                  disabled={
+                    isUpdating ||
+                    (status === "completed" && completeBlocked)
                   }
                   onClick={() => handleAdvance(status)}
                 >
-                  {STATUS_ACTION_LABEL[status]}
+                  {isUpdating
+                    ? "Đang xử lý..."
+                    : STATUS_ACTION_LABEL[status]}
                 </button>
               ))}
 
@@ -227,7 +293,7 @@ function OrderDetailView({ id }: { id?: string }) {
                 type="button"
                 className="secondary-button"
                 onClick={startEdit}
-                disabled={editing}
+                disabled={editing || isUpdating}
               >
                 ✏️ Sửa thông tin
               </button>
@@ -237,11 +303,20 @@ function OrderDetailView({ id }: { id?: string }) {
                   type="button"
                   className="danger-button"
                   onClick={() => setShowCancel(true)}
+                  disabled={isUpdating}
                 >
                   Hủy đơn
                 </button>
               )}
             </div>
+
+            {completeBlocked && (
+              <p className="order-process-hint">
+                Khách còn phải trả {formatPrice(remaining)}. Ghi nhận đủ
+                các khoản thu ở mục Trả góp bên dưới thì mới hoàn thành
+                được đơn.
+              </p>
+            )}
           </>
         )}
       </section>
@@ -303,6 +378,7 @@ function OrderDetailView({ id }: { id?: string }) {
 
               <select
                 id="edit-payment"
+                disabled={order.paymentMethod === "installment"}
                 value={form.paymentMethod}
                 onChange={(event) =>
                   setForm({
@@ -311,11 +387,17 @@ function OrderDetailView({ id }: { id?: string }) {
                   })
                 }
               >
-                {Object.entries(PAYMENT_LABEL).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
+                {Object.entries(PAYMENT_LABEL)
+                  .filter(([value]) =>
+                    order.paymentMethod === "installment"
+                      ? value === "installment"
+                      : value !== "installment",
+                  )
+                  .map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
               </select>
             </div>
 
@@ -350,6 +432,10 @@ function OrderDetailView({ id }: { id?: string }) {
         </form>
       )}
 
+      {/* TRẢ GÓP */}
+
+      <InstallmentPanel order={order} />
+
       {/* HÓA ĐƠN */}
 
       <section className="content-card invoice">
@@ -368,7 +454,21 @@ function OrderDetailView({ id }: { id?: string }) {
         <div className="invoice-meta">
           <div>
             <span>Khách hàng</span>
-            <strong>{order.customerName || "Khách lẻ"}</strong>
+
+            {order.customerPhone ? (
+              <Link
+                to={`/customers/${order.customerCode || canonicalPhone(order.customerPhone)}`}
+                className="order-product-link"
+              >
+                <strong>{order.customerName || "Khách lẻ"}</strong>
+              </Link>
+            ) : (
+              <strong>{order.customerName || "Khách lẻ"}</strong>
+            )}
+
+            {order.customerCode && (
+              <span className="customer-code">{order.customerCode}</span>
+            )}
           </div>
 
           <div>
@@ -389,6 +489,7 @@ function OrderDetailView({ id }: { id?: string }) {
                   ? "Hoàn thành lúc"
                   : "Hoàn thành"}
             </span>
+
             <strong>
               {isCancelled && order.cancelledAt
                 ? formatDateTime(order.cancelledAt)
@@ -496,6 +597,22 @@ function OrderDetailView({ id }: { id?: string }) {
               <span>Tổng thanh toán</span>
               <strong>{formatPrice(order.total)}</strong>
             </div>
+
+            {order.installment && (
+              <>
+                <div>
+                  <span>
+                    Đã thu ({order.installment.months} tháng)
+                  </span>
+                  <strong>{formatPrice(installmentPaid(order))}</strong>
+                </div>
+
+                <div>
+                  <span>Còn phải thu</span>
+                  <strong>{formatPrice(remaining)}</strong>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </section>
@@ -543,7 +660,11 @@ function OrderDetailView({ id }: { id?: string }) {
         <CancelOrderDialog
           order={order}
           onConfirm={handleCancelConfirm}
-          onClose={() => setShowCancel(false)}
+          onClose={() => {
+            if (!isUpdating) {
+              setShowCancel(false);
+            }
+          }}
         />
       )}
     </div>
